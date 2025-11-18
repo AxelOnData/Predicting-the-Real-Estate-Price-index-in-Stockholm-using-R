@@ -1,0 +1,1089 @@
+---
+title: "Final_Exam_PA"
+author: "Axel Olausson"
+date: "2025-08-13"
+output: html_document
+---
+ WELCOME TO MY FINAL PROJECT IN PREDICTIVE ANALYTICS
+
+This notebook will show all the steps for obtaining my forecast of
+the Swedish Real Estate Price Index for the greater Stockholm area.
+Theory will be more thoroughly explained in the report
+
+Enjoy!
+
+```{r}
+library(readxl)
+
+REPI <- read_excel("/Users/axelolausson/Desktop/Final\ Project\ -\ Predcitive\ Analytics/Fastighetsprisindex.xlsx")
+View(REPI)
+head(REPI)
+```
+
+```{r}
+tail(REPI)
+```
+
+
+In accordance to the tidy forecasting workflow suggested both in class and by
+Hyndman & Anthanasopoulos, I will work accordingly:
+  
+  1. Data Preparation
+  2. Plot the Data
+  3. Define a model
+  4. Train the model
+  5. Check model performance
+  6. Produce forecast
+  
+Granted that we are on the first step and that the data has been loaded
+next step is to process the data. Upon viewing the file, we see that 
+column headers are strange and that the file contains metadata. This needs to 
+be handled.
+
+Furthermore, the datatypes in both columns will be adjusted. 
+I will also turn the REPI object into a tsibble for easier analysis
+
+Lastly, the real estate price index is not inflation adjusted. In previous
+studies, adjustments have been made and as such, I will adjust the data using
+KPIF.
+
+```{r}
+colnames(REPI) = c("y_quarter", "REPI_value") #fixing columnnames
+REPI <- REPI[3:159, ] #slicing the dataframe to only include relevant data
+View(REPI)
+```
+
+```{r}
+REPI <- REPI %>%
+  mutate(
+    y_quarter = sub("k", " Q", y_quarter, ignore.case = TRUE), 
+    y_quarter = yearquarter(y_quarter),                        
+    REPI_value    = as.numeric(REPI_value)                            
+  ) %>%
+  
+  filter(!is.na(y_quarter), !is.na(REPI_value)) %>%
+  as_tsibble(index = y_quarter)
+```
+
+```{r}
+str(REPI)
+```
+That worked
+
+Now we load the KPIF-data so that we can adjust REPI
+
+```{r}
+KPIF <- read_excel("/Users/axelolausson/Desktop/Final\ Project\ -\ Predcitive\ Analytics/KPIF.xlsx")
+View(KPIF)
+
+#Also contains some metadata which needs to be adjusted, we also need to make the KPIF data quarterly
+colnames(KPIF) <- c("y_quarter", "KPIF_value")
+KPIF <- KPIF[2:463,]
+
+KPIF <- KPIF %>%
+  mutate(
+    year = as.numeric(substr(y_quarter, 1, 4)),
+    mon  = as.numeric(substr(y_quarter, 6, 7)),
+    
+    quarter = as.yearqtr(paste(year, mon), format = "%Y %m")
+  ) %>%
+  
+  group_by(quarter) %>%
+  summarise(KPIF_q = mean(KPIF_value, na.rm = TRUE), .groups = "drop")
+
+head(KPIF) #worked, now just making it into a tsibble
+
+KPIF <- KPIF %>%
+  mutate(quarter = yearquarter(quarter)) %>%
+  as_tsibble(index = quarter)
+
+```
+
+```{r}
+KPIF <- KPIF %>%
+  mutate(quarter = yearquarter(quarter)) %>%
+  as_tsibble(index = quarter)
+
+head(KPIF)
+
+"Fixing column names once again"
+
+colnames(KPIF) = c("y_quarter", "KPIF_q")
+```
+
+We can now adjust the REPI value to be inflation adjusted. Once that is done
+we can move over to step 2. 
+
+```{r}
+REPI <- KPIF%>%
+  inner_join(REPI, by = "y_quarter")%>%
+  mutate(
+    adj_repi = REPI_value / KPIF_q * 100
+  ) #Worked well
+```
+
+  1. Data Preparation (FINISHED)
+  2. Plot the Data
+  3. Define a model
+  4. Train the model
+  5. Check model performance
+  6. Produce forecast
+  
+  That concludes part one of the tidy forecasting workflow. The next step is to
+  plot the data to visually inspect the distribution of the time series, its
+  components via decomposition, signs of changing variance, autocorrelation and non-stationarity.
+  
+  Apart from inspecting the data visually, I will also inspect the lambda value and
+  perform both KPSS and ADF-test. 
+  
+  I will conclude the assessment by testing for structural breaks in the data.
+  
+  The results from these tests will be detrimental when defining our models.
+  
+```{r}
+REPI%>%
+  select(adj_repi)%>%
+  autoplot() + labs(title = "Real REPI - Greater Stockholm Area")
+
+```
+  From an inspection, there seems to be a general upwards going trend in the data
+  hinting towards non-stationarity. I see no clear signs of seasonality yet and
+  in terms of variation, there is slightly changing variance.
+  I do see hints of cycles, reflecting the financial markets possible effect
+  on housing prices. As explained in the report, many of the troughs and peaks
+  happen during periods of monetary policy adjustment. Given this, I will also
+  load in the Swedish Policy Rate (Styrräntan), which can be potentially used as an exogenous 
+  variable.
+  
+```{r}
+styr <- read_excel("/Users/axelolausson/Desktop/Final\ Project\ -\ Predcitive\ Analytics/RIKSBANKENS\ STYRRÄNTOR.xlsx")
+
+styr <- styr[5:128,]
+colnames(styr) <- c("y_quarter", "styrranta") #Realized here that I named it to its swedish name, sorry...
+
+styr <- styr %>%
+  filter(!is.na(y_quarter), !is.na(styrranta))
+
+# Convert Swedish quarter text to yearquarter
+styr <- styr %>%
+  mutate(
+    # Extract year and quarter number
+    year = as.numeric(substr(y_quarter, 1, 4)),
+    kvartal = as.numeric(gsub(".*Kvartal ", "", y_quarter)),
+    y_quarter = yearquarter(paste(year, "Q", kvartal, sep = ""))
+  ) %>%
+  select(y_quarter, styrranta) %>%
+  as_tsibble(index = y_quarter)
+
+styr <- styr %>%
+  mutate(
+    styrranta = as.numeric(gsub(",", ".", styrranta))  # replace comma with dot
+  )
+
+styr%>%
+  select(styrranta)%>%
+  autoplot() + labs(title = "Swedish Policy Rate - Q3 1994 to Q2 2025")
+```
+  
+The REPI can now be joined with the policy rate to create our forecasting
+dataset. Once this is done, more plots will be constructed and various tests
+will be done.
+  
+```{r}
+REPI_w_RATE <- styr%>%
+  inner_join(REPI, by = "y_quarter")
+```
+  
+Tests on the REPI can now continue. Once that is done, similar testing will be
+completed for the rate.
+
+```{r}
+REPI_w_RATE%>%
+  select(adj_repi)%>%
+  autoplot() + labs(title = "Real REPI - Greater Stockholm Area")
+```
+To combat changing variation in the dataset, which makes forecasting more 
+troubling, I check the lambda value, indicating if a mathematical
+transformation is necessary
+
+```{r}
+REPI_w_RATE%>%
+  features(adj_repi, features = guerrero)
+```
+
+The negative lambda value indicates that we need a transformation that
+is stronger than a log due to changing variation. 
+
+```{r}
+lambda_repi <- REPI_w_RATE%>%
+  features(adj_repi, features = guerrero)%>%
+  pull(lambda_guerrero)
+
+REPI_w_RATE%>%
+  autoplot(box_cox(adj_repi, lambda = lambda_repi)) + 
+  labs (title = "Adjusted Real Repi - Greater Stockholm Area")
+
+REPI_w_RATE <- REPI_w_RATE%>%
+  mutate(bc_adj_repi = box_cox(adj_repi, lambda = lambda_repi))
+```
+
+Moving on, we inspect the ACF-Plot
+
+```{r}
+REPI_w_RATE%>%
+  ACF(bc_adj_repi)%>%
+  autoplot() + labs(title = "ACF - Adjusted Real REPI")
+  
+```
+
+```{r}
+REPI_w_RATE%>%
+  PACF(bc_adj_repi)%>%
+  autoplot() + labs(title = "PACF - Adjusted Real REPI")
+```
+
+
+
+The ACF plot suggests that there is a trend but there are no clear signs
+of seasonality. We will however, investigate seasonality further. 
+
+Nonetheless, the optical inspection so far suggest non-stationarity
+
+```{r}
+library(forecast)
+
+REPI_w_RATE %>% 
+  select(bc_adj_repi) %>% 
+  as.ts %>% ggseasonplot() +
+ggtitle("Seasonality Plot")
+```
+
+Some slopes are more alligned, hinting towards some seasonality. Yet, there
+is no complete alignment so it is not very evident that seasonality exists
+
+To really investigate the trend and seasonality components of the time series,
+decomposition will now be made.
+
+```{r}
+REPI_w_RATE %>%
+  features(bc_adj_repi, feat_stl) %>%
+  select(trend_strength, seasonal_strength_year) 
+```
+We see a moderate seasonality existing but the main driver in this time series is 
+the trend component, further STL-decomposition graphs will now be constructed
+
+```{r}
+REPI_dcmp <- REPI_w_RATE%>%
+  model(
+    stl = STL(bc_adj_repi, robust = TRUE)) %>%
+  components()
+
+REPI_dcmp%>%
+  autoplot()
+```
+
+Now that we know the drivers, we conduct tests for stationarity.
+
+```{r}
+library(urca)
+
+summary(ur.kpss(REPI_w_RATE$bc_adj_repi, type = "mu")) 
+```
+The first test rejects the KPSS null hypothesis of stationartiy
+
+```{r}
+summary(ur.kpss(REPI_w_RATE$bc_adj_repi, type = "tau")) 
+```
+Second KPSS test also rejects
+
+Now testing with ADF
+
+```{r}
+summary(ur.df(REPI_w_RATE$bc_adj_repi, type = "trend"))
+```
+
+Failure to reject the null hypothesis of non-stationarity in the first test
+
+```{r}
+summary(ur.df(REPI_w_RATE$bc_adj_repi, type = "drift"))
+
+```
+
+Once again fails to reject.
+
+```{r}
+summary(ur.df(REPI_w_RATE$bc_adj_repi, type = "none"))
+
+```
+
+Failure to reject the test here too. Differencing is clearly needed. Now,
+testing for which order of difference is reccomended. 
+
+```{r}
+REPI_w_RATE%>%
+  features(bc_adj_repi, unitroot_ndiffs)
+```
+
+Second order difference required. Checking if seasonal differencing is also
+needed
+
+```{r}
+REPI_w_RATE%>%
+  features(bc_adj_repi, unitroot_nsdiffs)
+```
+
+No seasonal difference needed.
+
+In accordance with Hyndman and Athanopolous, we difference once before doing
+second order differencing to see if it helps stationarize data.
+
+```{r}
+REPI_w_RATE%>%
+  mutate(diff_repi = difference(bc_adj_repi))%>%
+  autoplot(diff_repi) + labs(title = "Differenced REPI")
+```
+
+Data looks slightly more stationary but it is difficult to say for certain.
+Will therefore check the diagnostics again to see if further differncing is necessary
+
+```{r}
+REPI_w_RATE <- REPI_w_RATE%>%
+  mutate(
+    diff_repi = difference(bc_adj_repi)
+  )
+
+summary(ur.kpss(na.omit(REPI_w_RATE$diff_repi), type = "tau"))
+```
+
+We cannot reject the test, suggesting stationarity
+
+```{r}
+summary(ur.kpss(na.omit(REPI_w_RATE$diff_repi), type = "mu"))
+```
+
+Again we fail to reject the test, hinting towards stationarity.
+Now doing the ADF-tests
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_repi), type = "trend"))
+```
+
+
+```{r}
+```
+
+First test rejects null hypothesis of non-stationarity
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_repi), type = "drift"))
+```
+
+
+Second test also rejects the null hypothesis
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_repi), type = "none"))
+
+```
+
+Third tests also rejects. Showing that the time series is stationary at
+every significance level.
+
+Doing a final check of reccomended differences
+
+```{r}
+REPI_w_RATE%>%
+  features(diff_repi, unitroot_ndiffs)
+```
+
+The test still recommends one difference. However, as advised by
+Hyndman & Athanopolous. Applying more differencing than necessary can introduce
+false dynamics or autocorrelations that do not actually exists in the time series, therefore, as few
+differences as necessary should be made.
+
+There is also a degree of subjectivity attached to differencing and as such
+I choose to not difference any further, given that all tests show that no
+more differencing is necessary.
+
+Now, we need to go through the same process with the policy rate as we did
+with the REPI. After that, we test for strucutral breaks before the 
+forecasting models are chosen
+
+```{r}
+REPI_w_RATE%>%
+  features(styrranta, guerrero)
+```
+
+High guerrero, will adjust
+
+```{r}
+lambda_styr <- REPI_w_RATE%>%
+  features(styrranta, guerrero)%>%
+  pull(lambda_guerrero)
+
+REPI_w_RATE%>%
+  autoplot(box_cox(styrranta, lambda = lambda_styr))
+
+REPI_w_RATE <- REPI_w_RATE%>%
+  mutate(adj_styr = box_cox(styrranta, lambda = lambda_styr))
+```
+
+Now onto the ACF and the seasonality plot
+
+```{r}
+REPI_w_RATE%>%
+  ACF(adj_styr)%>%
+  autoplot() + labs (title = "ACF - Adj Policy Rate")
+```
+
+Similar pattern spotted here with a strong trend and seemingly no seasonality
+
+```{r}
+REPI_w_RATE %>% 
+  select(adj_styr) %>% 
+  as.ts %>% ggseasonplot() +
+ggtitle("Seasonality Plot")
+```
+
+A lot of overlap in the slopes, showing virtually no signs of seasonality
+
+```{r}
+REPI_w_RATE %>%
+  features(adj_styr, feat_stl) %>%
+  select(trend_strength, seasonal_strength_year) 
+```
+
+Strong trend, weak seasonality
+
+```{r}
+REPI_dcmp <- REPI_w_RATE%>%
+  model(
+    stl = STL(adj_styr, robust = TRUE)) %>%
+  components()
+
+REPI_dcmp%>%
+  autoplot()
+```
+
+Now investigating stationarity
+
+```{r}
+summary(ur.kpss(REPI_w_RATE$adj_styr, type = "mu")) 
+```
+We reject null of stationarity
+
+```{r}
+summary(ur.kpss(REPI_w_RATE$adj_styr, type = "tau")) 
+
+```
+similar result
+
+```{r}
+summary(ur.df(REPI_w_RATE$adj_styr, type = "trend")) 
+
+```
+
+We cannot reject the null hypothesis regarding seasonality
+
+```{r}
+summary(ur.df(REPI_w_RATE$adj_styr, type = "drift")) 
+```
+Similar result
+
+```{r}
+summary(ur.df(REPI_w_RATE$adj_styr, type = "none")) 
+
+```
+This test however allows us to reject non-stationarity. However, due to
+overwhealming evidence that the data is non-stationary. First-order differencing
+will be taken.
+
+```{r}
+REPI_w_RATE%>%
+  features(adj_styr, unitroot_ndiffs)
+```
+Even though we know that the data is not exhibiting seasonality to a 
+significant extent, we still test for seasonal differencing needs.
+
+```{r}
+REPI_w_RATE%>%
+  features(diff_repi, unitroot_nsdiffs)
+```
+
+```{r}
+REPI_w_RATE%>%
+  mutate(diff_styr = difference(adj_styr))%>%
+  autoplot(diff_styr) + labs(title = "Differenced Policy Rate")
+
+REPI_w_RATE <- REPI_w_RATE%>%
+  mutate(diff_styr = difference(adj_styr))
+```
+Looks roughly stationary but to be on the cautionary side, we apply tests again
+
+```{r}
+summary(ur.kpss(na.omit(REPI_w_RATE$diff_styr), type = "tau"))
+```
+We fail to reject the null hypothesis, showing evidence in favor of stationarity
+
+```{r}
+summary(ur.kpss(na.omit(REPI_w_RATE$diff_styr), type = "mu"))
+
+```
+Same result
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_styr), type = "trend"))
+
+```
+
+Rejection in favor of stationarity
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_styr), type = "drift"))
+
+```
+
+```{r}
+summary(ur.df(na.omit(REPI_w_RATE$diff_styr), type = "none"))
+
+```
+
+All tests in favor of stationarity. Checking recommended differences
+
+```{r}
+REPI_w_RATE%>%
+  features(diff_styr, unitroot_ndiffs)
+```
+
+Worked well. Before prediciton, we now complete the sis test
+
+```{r}
+fit_dyn <- REPI_w_RATE %>%
+  model(
+    ARIMA(diff_repi ~ pdq(d = 0) + PDQ(D = 0), stepwise = FALSE, approximation = FALSE)
+  )
+
+report(fit_dyn) 
+```
+
+```{r}
+REPI_w_RATE <- REPI_w_RATE %>%
+  mutate(
+    l1 = lag(diff_repi, 1),
+    l2 = lag(diff_repi, 2),
+    l3 = lag(diff_repi, 3),
+    ls = lag(diff_repi, 4)  # seasonal lag for quarterly data
+  ) %>%
+  drop_na()
+```
+
+```{r}
+qlr <- Fstats(
+  diff_repi ~ 1 + l1 + l2 + l3 +ls + diff_styr,
+  data = as.ts(REPI_w_RATE),
+  from = 0.15   # trim to avoid very early breaks
+)
+
+sctest(qlr, type = "supF")         # Test for break
+bp <- breakpoints(qlr, alpha = 0.05) # Locate break
+bp
+plot(qlr, alpha = 0.05, main = "F-statistics for Break Test")
+lines(bp)
+```
+
+```{r}
+REPI_w_RATE_zoo <- as.zoo(as.ts(REPI_w_RATE))
+
+sis <- isat(
+  REPI_w_RATE_zoo$diff_repi,
+  ar = c(1:4),     # from ARIMA orders
+  mc = TRUE,
+  mxreg = REPI_w_RATE_zoo$diff_styr
+)
+
+summary(sis)
+plot(sis)
+```
+```{r}
+sis
+```
+
+
+Now it is time to fit the models and the chosen ones are ARIMA and Dynamic regression
+The arguments as to why the models were chosen can be found in the report. 
+
+  
+  1. Data Preparation (FINISHED)
+  2. Plot the Data (FINISHED)
+  3. Define a model (FINISHED)
+  4. Train the model
+  5. Check model performance
+  6. Produce forecast
+  
+  
+Once that is done, we do a train test split on the data
+
+```{r}
+split_n <- floor(0.8 * nrow(REPI_w_RATE))
+
+train_set <- REPI_w_RATE %>% slice_head(n = split_n)
+test_set  <- REPI_w_RATE %>% slice_tail(n = nrow(REPI_w_RATE) - split_n)
+```
+
+Now we can start our models
+
+The fable package will automatically back transform forecasts whenever
+a transformation has been used in the model definition. We can also check
+the autocorrelation of the differenced series for the ARIMAS
+
+```{r}
+REPI_w_RATE%>%
+  ACF(diff_repi)%>%
+  autoplot() + labs(title = "ACF on Differenced Real REPI")
+```
+
+```{r}
+REPI_w_RATE%>%
+  PACF(diff_repi)%>%
+  autoplot() + labs(title = "PACF on Differenced Real REPI")
+```
+
+Thereby:
+
+```{r}
+fit_ARIMA <- train_set%>%
+  model(
+    AUTO_ARIMA = ARIMA(box_cox(adj_repi, lambda = lambda_repi)),
+    ARIMA_110 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,0)),
+    ARIMA_210 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,0)),
+    ARIMA_120 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,2,0)),
+    ARIMA_111 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1)),
+    ARIMA_211 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,1)),
+    
+    SARIMA_011011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(0,1,1) + PDQ(0,1,1,4)),
+    SARIMA_111011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1) + PDQ(0,1,1,4)),
+    SARIMA_AUTO = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq() + PDQ())
+  )
+glance(fit_ARIMA)%>%
+  arrange(AICc)
+```
+The best model is the ARIMA_110
+
+```{r}
+fit_ARIMA%>%
+  select(ARIMA_110)%>%
+  gg_tsresiduals("innovation")
+```
+No autocorrelation in residuals, looks like white noise. Slight skew
+
+```{r}
+fit_ARIMA %>%
+  select(ARIMA_110) %>%
+  report()
+```
+
+
+```{r}
+fit_ARIMA%>%
+  select(ARIMA_110)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 4, lag = 10)
+```
+Portmanteu test passed
+
+```{r}
+fc_ARIMA <- fit_ARIMA%>%
+  select(ARIMA_110)%>%
+  forecast(h = nrow(test_set))
+```
+
+```{r}
+fc_ARIMA%>%
+  autoplot(REPI_w_RATE) +
+  labs(title = "Forecasted Real REPI - ARIMA(110)")
+```
+```{r}
+accuracy(fc_ARIMA, test_set)
+
+```
+
+We then fit the ARIMAX. 
+
+```{r}
+fit_arimaxx <- train_set%>% 
+  model(
+    dynreg = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(d = 1) + diff_styr))
+```
+
+
+```{r}
+fit_arimaxx%>%
+  select(dynreg)%>%
+  gg_tsresiduals("innovation")
+```
+Looks fine
+
+```{r}
+fit_arimaxx%>%
+  select(dynreg)%>%
+  report()
+```
+
+
+```{r}
+fit_arimaxx%>%
+  select(dynreg)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 4, lag = 10)
+```
+Fine, now forecast
+
+```{r}
+fc_arimaxx <- fit_arimaxx%>%
+  select(dynreg)%>%
+  forecast(new_data = test_set%>%
+             dplyr::select(y_quarter, diff_styr))
+
+
+```
+
+```{r}
+fc_arimaxx%>%
+  autoplot(REPI_w_RATE) +
+  labs(title = "Forecasted Real REPI - Dynamic Regression")
+```
+```{r}
+accuracy(fc_arimaxx, test_set)
+```
+
+Now we do the same thing but we take the structural break into consideration
+
+Breakpoints at observation number:
+19 
+
+```{r}
+REPI_w_RATE_1 <- REPI_w_RATE[20:nrow(REPI_w_RATE),]
+```
+
+Now we do the exact same tests
+
+```{r}
+split_n_1 <- floor(0.8 * nrow(REPI_w_RATE_1))
+
+train_set_1 <- REPI_w_RATE_1 %>% slice_head(n = split_n_1)
+test_set_1  <- REPI_w_RATE_1 %>% slice_tail(n = nrow(REPI_w_RATE_1) - split_n_1)
+```
+
+Now ARIMA
+
+```{r}
+fit_ARIMA_1 <- train_set_1%>%
+  model(
+    AUTO_ARIMA = ARIMA(box_cox(adj_repi, lambda = lambda_repi)),
+    ARIMA_110 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,0)),
+    ARIMA_210 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,0)),
+    ARIMA_120 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,2,0)),
+    ARIMA_111 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1)),
+    ARIMA_211 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,1)),
+    
+    SARIMA_011011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(0,1,1) + PDQ(0,1,1,4)),
+    SARIMA_111011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1) + PDQ(0,1,1,4)),
+    SARIMA_AUTO = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq() + PDQ())
+  )
+glance(fit_ARIMA_1)%>%
+  arrange(AICc)
+```
+AUTO_ARIMA works best
+
+```{r}
+fit_ARIMA_1%>%
+  select(AUTO_ARIMA)%>%
+  report()
+```
+Lets plot
+
+```{r}
+fit_ARIMA_1%>%
+  select(AUTO_ARIMA)%>%
+  gg_tsresiduals("innovation")
+```
+Looks fine in terms of innovation residuals, no significant autocorrelation
+Residuals slightly skewed
+
+```{r}
+fit_ARIMA_1%>%
+  select(AUTO_ARIMA)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 3, lag = 10)
+```
+We are looking good, time to forecast
+
+```{r}
+fc_ARIMA_1 <- fit_ARIMA_1%>%
+  select(AUTO_ARIMA)%>%
+  forecast(h = nrow(test_set_1))
+```
+
+Now plot
+
+```{r}
+fc_ARIMA_1 %>%
+  autoplot(REPI_w_RATE_1) +
+  labs(title = "Forecasted Real REPI acc Breaks - ARIMA(0,1,1)(1,0,0)")
+```
+```{r}
+accuracy(fc_ARIMA_1, test_set_1)
+```
+Then finally we look at the Dynamic Regression
+
+```{r}
+fit_arimaxx_1 <- train_set_1%>% 
+  model(
+    dynreg = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(d = 1) + diff_styr))
+```
+
+Then we look at the residual plots
+
+```{r}
+fit_arimaxx_1%>%
+  select(dynreg)%>%
+  gg_tsresiduals("innovation")
+```
+Then ljung box
+
+```{r}
+fit_arimaxx_1%>%
+  select(dynreg)%>%
+  report()
+```
+
+
+```{r}
+fit_arimaxx_1%>%
+  select(dynreg)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 3, lag = 10)
+```
+
+
+```{r}
+fc_arimaxx_1 <- fit_arimaxx_1%>%
+  select(dynreg)%>%
+  forecast(new_data = test_set_1%>%
+             dplyr::select(y_quarter, diff_styr))
+```
+
+```{r}
+fc_arimaxx_1%>%
+  autoplot(REPI_w_RATE_1) +
+  labs(title = "Forecasted Real REPI - Dynamic Regression No Break")
+```
+```{r}
+accuracy(fc_arimaxx_1, test_set_1)
+```
+
+Maybe a final trial with leaving out some data
+
+```{r}
+REPI_w_RATE_2 <- REPI_w_RATE[8:nrow(REPI_w_RATE),]
+```
+
+```{r}
+split_n_2 <- floor(0.8 * nrow(REPI_w_RATE_2))
+
+train_set_2 <- REPI_w_RATE_2 %>% slice_head(n = split_n_2)
+test_set_2 <- REPI_w_RATE_2 %>% slice_tail(n = nrow(REPI_w_RATE_2) - split_n_2)
+```
+
+And now we forecast
+Onto the ARIMA
+
+```{r}
+fit_ARIMA_2 <- train_set_2%>%
+  model(
+    AUTO_ARIMA = ARIMA(box_cox(adj_repi, lambda = lambda_repi)),
+    ARIMA_110 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,0)),
+    ARIMA_210 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,0)),
+    ARIMA_120 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,2,0)),
+    ARIMA_111 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1)),
+    ARIMA_211 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(2,1,1)),
+    
+    SARIMA_011011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(0,1,1) + PDQ(0,1,1,4)),
+    SARIMA_111011 = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(1,1,1) + PDQ(0,1,1,4)),
+    SARIMA_AUTO = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq() + PDQ())
+  )
+glance(fit_ARIMA_2)%>%
+  arrange(AICc)
+```
+The 110 is best
+
+```{r}
+fit_ARIMA_2%>%
+  select(ARIMA_110)%>%
+  gg_tsresiduals("innovation")
+```
+```{r}
+fit_ARIMA_2%>%
+  select(ARIMA_110)%>%
+  report()
+```
+
+```{r}
+fit_ARIMA_2%>%
+  select(ARIMA_110)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 4, lag = 10)
+```
+```{r}
+fc_ARIMA_2 <- fit_ARIMA_2%>%
+  select(ARIMA_110)%>%
+  forecast(h = nrow(test_set_2))
+```
+
+Plot
+
+```{r}
+fc_ARIMA_2 %>%
+  autoplot(REPI_w_RATE_2) +
+  labs(title = "Forecasted Real REPI acc Some Breaks - ARIMA(1,1,0)")
+```
+```{r}
+accuracy(fc_ARIMA_2, test_set_2)
+```
+
+
+
+Finally ARIMAX
+
+```{r}
+fit_arimaxx_2 <- train_set_2%>% 
+  model(
+    dynreg = ARIMA(box_cox(adj_repi, lambda = lambda_repi) ~ pdq(d = 1) + diff_styr))
+```
+
+```{r}
+fit_arimaxx_2%>%
+  select(dynreg)%>%
+  gg_tsresiduals("innovation")
+```
+```{r}
+fit_arimaxx_2%>%
+  select(dynreg)%>%
+  report()
+```
+```{r}
+glance(fit_arimaxx_2)%>%
+  arrange(AICc)
+```
+
+```{r}
+fit_arimaxx_2%>%
+  select(dynreg)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 4, lag = 10)
+```
+```{r}
+fc_arimaxx_2 <- fit_arimaxx_2%>%
+  select(dynreg)%>%
+  forecast(new_data = test_set_2%>%
+             dplyr::select(y_quarter, diff_styr))
+```
+
+```{r}
+fc_arimaxx_2%>%
+  autoplot(REPI_w_RATE_2) + labs(title = "Forecast Dynamic Regression")
+```
+
+
+```{r}
+accuracy(fc_arimaxx_2, test_set_2)
+```
+Dynamic regression with ignoring some strucutral break best
+
+We forecast it forward
+
+```{r}
+h_extra <- 12  
+
+
+future_idx <- new_data(test_set_2, n = h_extra)  
+
+future_path <- future_idx %>%
+  mutate(diff_styr = 0)
+
+
+nd_all <- bind_rows(
+  test_set_2 %>% select(y_quarter, diff_styr),
+  future_path      %>% select(y_quarter, diff_styr)
+)
+
+
+fc_arimaxx_2_long <- fit_arimaxx_2 %>%
+  select(dynreg) %>%
+  forecast(new_data = nd_all)
+
+```
+dasd
+```{r}
+fc_arimaxx_2_long%>%
+  autoplot(REPI_w_RATE_2) + labs(title = "Final Forecast - Dynamic Regression")
+```
+
+Trying some more stuff
+
+```{r}
+fit_arimax_grid <- train_set_2 %>%
+  model(
+    arimax_auto   = ARIMA(box_cox(adj_repi, lambda_repi) ~ diff_styr + pdq(d = 1) + PDQ(D = 0),
+                          stepwise = FALSE, approximation = FALSE),
+    arimax_110    = ARIMA(box_cox(adj_repi, lambda_repi) ~ pdq(1,1,0) + diff_styr),
+    arimax_210    = ARIMA(box_cox(adj_repi, lambda_repi) ~ pdq(2,1,0) + diff_styr),
+    arimax_211    = ARIMA(box_cox(adj_repi, lambda_repi) ~ pdq(2,1,1) + diff_styr),
+    arimax_sar10  = ARIMA(box_cox(adj_repi, lambda_repi) ~ pdq(2,1,0) + PDQ(1,0,0) + diff_styr),  # light seasonal AR
+  )
+
+glance(fit_arimax_grid) %>% arrange(AICc)
+
+```
+```{r}
+fit_arimax_grid%>%
+  select(arimax_auto)%>%
+  report()
+```
+Now we look at residuals
+
+```{r}
+fit_arimax_grid%>%
+  select(arimax_auto)%>%
+  gg_tsresiduals("innovation")
+```
+Portmanteu
+
+```{r}
+fit_arimax_grid%>%
+  select(arimax_auto)%>%
+  residuals()%>%
+  features(features = ljung_box, dof = 5, lag = 10)
+```
+Then we predict
+
+```{r}
+fc_arimaxx_final <- fit_arimax_grid%>%
+  select(arimax_auto)%>%
+  forecast(new_data = test_set_2%>%
+             dplyr::select(y_quarter, diff_styr))
+```
+
+Now plot
+
+```{r}
+fc_arimaxx_final%>%
+  autoplot(REPI_w_RATE_2) + labs("Prediction using dynamic regression")
+```
+
+Now we finally look at accuracy
+
+```{r}
+accuracy(fc_arimaxx_final, test_set_2)
+```
+
